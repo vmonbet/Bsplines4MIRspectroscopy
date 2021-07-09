@@ -1,0 +1,278 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+Libraries and functions
+```{r}
+rm(list = ls())
+packages_list = c("fda",
+                  "signal",
+                  "FactoMineR",
+                  "tidyverse",
+                  "caret",
+                  "randomForest",
+                  "pROC",
+                  "ggplot2")
+installed_list = installed.packages()
+for (pack in packages_list){
+  if  (length(intersect(installed_list,pack))==0){ install.packages(pack) }
+  library(pack, character.only = TRUE)
+}
+
+
+
+projRecomp = function(xdata, nBasis, t = 1:dim(xdata)[2], basis = "Splines"){
+  t = sort((t-min(t))/(max(t)-min(t)))
+  if (basis == "Fourier") {basisobj = create.fourier.basis(nbasis = nBasis)}
+  if (basis == "Splines") {basisobj = create.bspline.basis(norder = 3, breaks = seq(head(t,1), tail(t,1), length = nBasis-1))}
+  BFunction = getbasismatrix(t, basisobj) 
+  Fdata = t(sapply(1:nrow(xdata), 
+                   FUN = function(i) t(solve(t(BFunction)
+                                             %*% BFunction)%*% t(BFunction) %*% xdata[i,])))
+  FdataRec = t(sapply(1:nrow(xdata), 
+                      FUN = function(i) t(BFunction %*% solve(t(BFunction)%*% BFunction)%*% 
+                                            t(BFunction) %*% xdata[i,])))
+  return(list(coeffProj = Fdata, foncRecon = FdataRec, BFunction = BFunction, basisobj = basisobj))
+}
+
+Norm_ref = function(rawData,p,ref_spectra = "mean"){
+  if (ref_spectra=="mean"){
+    ref =  apply(rawData[,1:p],2,mean)
+  } else {ref=ref_spectra}
+  ref = as.matrix(ref,p,1)
+  normData = rawData
+  for (i in 1:dim(rawData)[1]){
+    S = c(as.matrix(rawData[i,1:p],p,1))
+    res = lm(ref~S)
+    normData[i,1:p] = res$fitted.values
+  }
+  colnames(normData)=colnames(rawData)
+  rownames(normData)=rownames(rawData)
+  return(normData)
+}
+```
+Meat database
+
+description in https://www.sciencedirect.com/science/article/abs/pii/S0308814696002890?via%3Dihub
+
+Here we focus on the problem of recognizing chicken/pork/turkey meats from MIR spectra. We use only one spectra for each sample (2 are given).
+```{r}
+MIRFreshMeats <- read.csv("~/Téléchargements/MIRFreshMeats.csv", header=TRUE, row.names=1)
+Y = unlist(strsplit(colnames(MIRFreshMeats),"_"))[seq(1,120*4,4)]
+meat = t(MIRFreshMeats[seq(1,120,2)])
+Y = Y[seq(1,120,2)]
+freq = rownames(MIRFreshMeats)
+frequency = as.numeric(freq)
+```
+Preprocessing
+```{r}
+#fingerprint choice
+fingerprint=which(frequency>1000&frequency<1800)
+rawData=meat[,fingerprint]
+
+##normalisation
+rawData_n = Norm_ref(rawData,p=dim(rawData)[2])
+rawData_n = as.matrix(rawData_n)
+
+# Calcul des dérivées secondes par Golay
+Sd2raman = apply(rawData_n,1,sgolayfilt,p=3,n=13,m=2)
+str(Sd2raman)
+Sd2raman = t(Sd2raman)
+par(mfrow=c(2,1),mar=c(5,3,3,3))
+plot(frequency[fingerprint],c(rawData_n[1,]),typ="l",xlab = "Frequencies",ylab="MIR")
+title("raw data")
+plot(frequency[fingerprint],Sd2raman[1,],typ="l",xlab = "Frequencies",ylab="MIR, D2")
+colnames(Sd2raman)=frequency[fingerprint]
+title("2nd order derivatives")
+
+rawData_clean=Sd2raman
+```
+## Descriptive statistics
+
+A Principal Component Aanalysis is performed to have a first look on the data. 
+```{r}
+fingerprint=which(frequency>1000&frequency<1800)
+
+rawData=rawData_clean[,-length(rawData_clean)]
+
+plot(frequency[fingerprint], rawData_clean[1,], type="l")
+pca=PCA(rawData, nc=2,graph=FALSE)
+col = rep(1,length(Y))
+col[Y=="FreshPork"] = 2
+col[Y=="FreshTurkey"] = 3
+plot(pca$ind$coord,col=col,pch=20)
+```
+## Decomposition of the 2nd derivatives on spline basis
+
+Construction of Splines succession
+```{r}
+w_f=fingerprint
+finger= frequency[w_f]
+
+b=c(7,5,3)
+p = length(finger)
+VI = matrix(0,length(b),p)
+x_all = NULL
+cnt = 1
+L = 0
+x_recom = NULL
+resolution_indices = list()
+for (i in b){
+  nBasis = round(p/i)
+  L = L + nBasis
+  x = projRecomp(as.matrix(rawData), nBasis = nBasis)
+  if (cnt==1){
+    x_all = x$coeffProj
+    x_recom= x$foncRecon
+    resolution_indices[[cnt]] = 1:length(x$coeffProj[1,])
+  } else {
+    resolution_indices[[cnt]] = dim(x_all)[2]+(1:length(x$coeffProj[1,]))
+    x_all = cbind(x_all,x$coeffProj)
+    x_recom= cbind(x_recom, x$foncRecon)
+
+  }
+  cnt = cnt+1
+}
+
+print("Splines projection done")
+```
+Visualisation of splines succession
+```{r}
+plot(finger,rawData[10,],typ="l",xlab="Frequence (in cm-1)",ylab="Absorbance")
+      lines(finger,x_recom[10,1:length(finger)],col="red")
+      lines(finger,x_recom[10,length(finger)+1:length(finger)],col="green")
+      lines(finger,x_recom[10,2*length(finger)+1:length(finger)],col="blue")
+legend("bottomleft",c("low (7)","medium (5)","high (3)"),col=c("red","green","blue"),lty=1)
+```
+## Random forest prediction model
+
+Now a random forest os fit to predict the meat type given the D2 MIR spectra. 
+
+A first step consists in selecting parameters of the algorithm. Here, we focus on the number of variables which are considered at each nodes of the trees. This parameters is referred to as mtry in the randomForest package. 
+```{r}
+dataset = data.frame(x_all)
+
+dataset$Class = as.factor(Y)
+
+set.seed(12)
+inTraining <- createDataPartition(dataset$Class, p = .9, list = FALSE)
+training <- dataset[ inTraining,]
+testing  <- dataset[-inTraining,]
+
+#10 folds repeat 5 times
+control <- trainControl(method='repeatedcv', 
+                        number=10, 
+                        repeats=5,
+                        classProbs=TRUE,
+                        allowParallel= TRUE)
+
+# Number randomly variable selected is mtry######################################
+
+mtry <- c(10,30,50,100,200)
+tunegrid <- expand.grid(.mtry=mtry)
+rf_default <- train(Class~., 
+                    data=training, 
+                    method='rf', 
+                    metric="Accuracy", 
+                    tuneGrid = tunegrid,
+                    trControl=control)
+print(rf_default)
+```
+
+Machine learning model built on the set of 3 resolutions
+```{r}
+mtry = rf_default$finalModel$mtry
+
+set.seed(12)
+pred_all  = x_test_all = y_test = roc_all = NULL
+
+for (rep in (1:50)){
+    inTraining <- createDataPartition(dataset$Class, p=.9, list = FALSE)
+    training <- dataset[inTraining,]
+    testing  <- dataset[-inTraining,]
+    rf=randomForest(Class~.,data = training, mtry=mtry, ntree=2000)
+    pred = predict(rf, newdata = testing, type = "respons")
+    pred_all = c(pred_all,pred)
+    x_test_all = c(x_test_all,setdiff(1:dim(rawData)[2],inTraining))
+    y_test =c(y_test, testing$Class)
+
+    }
+
+# matrice de confusion
+confusion_matrix = table(y_test,pred_all)
+rownames(confusion_matrix) = unique(dataset$Class)
+colnames(confusion_matrix) = unique(dataset$Class)
+print("Confusion matrix")
+print(confusion_matrix)
+```
+
+Visualisation of important variables
+```{r}
+VI_rf_default = matrix(0,length(c(7,5,3)),p)
+i_deb = 0
+cnt = 1
+for (i in c(7,5,3)){
+  nBasis = round(p/i)
+  end = min(nBasis*i,p)
+  VI_rf_default[cnt,1:end] = c(t(matrix(rf$importance[i_deb+(1:nBasis)],nBasis,i)))[1:end]
+  i_deb = i_deb+nBasis
+  cnt = cnt+1
+}
+matrix_plot=t(VI_rf_default)
+rownames(matrix_plot)=substr(finger,1,4)
+colnames(matrix_plot)=c(7,5,3)
+
+image(matrix_plot,col = hcl.colors(10, "Spectral", rev = TRUE),  axes=FALSE,)
+axis(2, at=seq(0,1, length=3), labels=colnames(matrix_plot), lwd=0, pos=0)
+axis(3, at=seq(0,1, length=length(finger)), labels=rownames(matrix_plot), lwd=0, pos=-0.65)
+```
+
+For a sake of comparison, the random forest model is also fit separately on each resolution. 
+```{r}
+pred_all_one_res = x_test_all_one_res = y_test_one_res = roc_all_one_res = NULL
+for (cnt in 1:3){
+    set.seed(12)
+    pred_all_one_res[[cnt]]  = x_test_all_one_res[[cnt]] = y_test_one_res[[cnt]] = list()
+    roc_all_one_res[[cnt]] = matrix(NA,1,30)
+    for (rep in (1:50)){
+      inTraining <- createDataPartition(dataset$Class, p=.9, list = FALSE)
+      training <- cbind(dataset[ inTraining,resolution_indices[[cnt]]],dataset$Class[inTraining])
+      colnames(training)[length(resolution_indices[[cnt]])+1] = "Class"
+      testing  <- cbind(dataset[-inTraining,resolution_indices[[cnt]]],dataset$Class[-inTraining])
+      colnames(testing) = colnames(training)
+      rf=randomForest(Class~.,data = training, mtry=50, ntree=2000)
+      pred = predict(rf, newdata = testing, type = "respons")
+      pred_all_one_res[[cnt]][[rep]] = pred
+      x_test_all_one_res[[cnt]][[rep]] = setdiff(1:dim(rawData)[2],inTraining)
+      y_test_one_res[[cnt]][[rep]] = testing$Class
+    }
+}
+for (cnt in 1:3) {
+  print(paste("Resolution ",b[cnt]))
+  print(table(unlist(y_test_one_res[[cnt]]),unlist(pred_all_one_res[[cnt]])))
+} 
+```
+
+Comparison of the confusion matrices
+```{r}
+print(paste("Resolutions ", b[1],",", b[2]," and ", b[3],"all together"))
+print(confusion_matrix/100)
+
+for (cnt in 1:3) {
+  print(paste("Resolution ",b[cnt]))
+  print(table(unlist(y_test_one_res[[cnt]]),unlist(pred_all_one_res[[cnt]]))/100)
+} 
+```
+
+sVisualisation of confusion matrix
+```{r}
+miss_classified=c(5,11,11,6,0.1,0.1,3,0.1,0.1,1,2,7)
+species=rep(c('chicken','pork','turkey'),each=4)
+resolutions=rep(c('7,5,3','7','5','3'),3)
+plot<-data.frame(miss_classified,species,resolutions)
+
+p0<-ggplot(data=plot, aes(x=species, y=miss_classified, fill=resolutions)) +
+geom_bar(stat="identity", position=position_dodge())+
+theme_minimal()+ scale_fill_brewer(palette="Set3")
+p0
+```
